@@ -1,0 +1,2 @@
+confluent-kafka==1.9.2
+six==1.16.0
