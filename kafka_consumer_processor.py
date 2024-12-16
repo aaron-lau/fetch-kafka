@@ -10,6 +10,50 @@ BOOTSTRAP_SERVERS = 'localhost:29092'
 INPUT_TOPIC = 'user-login'
 OUTPUT_TOPIC = 'processed-logins'
 
+# PostgreSQL configuration
+PG_CONFIG = {
+    'dbname': 'your_database',
+    'user': 'your_user',
+    'password': 'your_password',
+    'host': 'localhost',
+    'port': '5432'
+}
+
+# Create table SQL
+CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS user_logins (
+    id SERIAL PRIMARY KEY,
+    user_id VARCHAR(255),
+    app_version VARCHAR(50),
+    device_type VARCHAR(50),
+    locale VARCHAR(50),
+    device_id VARCHAR(255),
+    ip_address VARCHAR(255),
+    processed_timestamp BIGINT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# Insert SQL
+INSERT_SQL = """
+INSERT INTO user_logins (
+    user_id, app_version, device_type, locale, 
+    device_id, ip_address, processed_timestamp
+) VALUES (
+    %s, %s, %s, %s, %s, %s, %s
+);
+"""
+
+def init_postgres():
+    """Initialize PostgreSQL connection and create table if not exists"""
+    conn = psycopg2.connect(**PG_CONFIG)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute(CREATE_TABLE_SQL)
+    cur.close()
+    conn.autocommit = False
+    return conn
+
 # Create Kafka consumer
 consumer = Consumer({
     'bootstrap.servers': BOOTSTRAP_SERVERS,
@@ -81,6 +125,14 @@ locale_counts = defaultdict(int)
 masked_ip_counts = defaultdict(int)
 masked_device_counts = defaultdict(int)
 
+# Initialize PostgreSQL connection
+pg_conn = init_postgres()
+pg_cur = pg_conn.cursor()
+
+# Buffer for batch inserts
+insert_buffer = []
+BATCH_SIZE = 100
+
 # Main processing loop
 try:
     while True:
@@ -105,6 +157,24 @@ try:
             locale_counts[processed_data['locale']] += 1
             masked_ip_counts[processed_data['ip_address']] += 1
             masked_device_counts[processed_data['device_id']] += 1
+
+            # Prepare data for PostgreSQL
+            pg_record = (
+                processed_data['user_id'],
+                processed_data['app_version'],
+                processed_data['device_type'],
+                processed_data['locale'],
+                processed_data['device_id'],
+                processed_data['ip_address'],
+                processed_data['processed_timestamp']
+            )
+            insert_buffer.append(pg_record)
+
+            # Batch insert to PostgreSQL when buffer is full
+            if len(insert_buffer) >= BATCH_SIZE:
+                execute_batch(pg_cur, INSERT_SQL, insert_buffer)
+                pg_conn.commit()
+                insert_buffer = []
 
             # Produce processed data to output topic
             producer.produce(OUTPUT_TOPIC, json.dumps(processed_data).encode('utf-8'))
@@ -135,4 +205,13 @@ except KeyboardInterrupt:
     pass
 
 finally:
+
+    # Insert any remaining records in the buffer
+    if insert_buffer:
+        execute_batch(pg_cur, INSERT_SQL, insert_buffer)
+        pg_conn.commit()
+    
+    # Close all connections
+    pg_cur.close()
+    pg_conn.close()
     consumer.close()
